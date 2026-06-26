@@ -1,0 +1,9 @@
+# Core (Kaggle T4 images already ship CUDA-enabled torch + triton)
+torch>=2.1
+triton>=2.1
+transformers>=4.44
+accelerate>=0.30
+numpy
+# Benchmark plots + tests
+matplotlib
+pytest
