@@ -7,7 +7,9 @@ from bitnet.quantize import absmean_quantize, pack_ternary
 from kernels.bitnet_kernel import (
     HAS_TRITON,
     bitnet_matmul,
+    bitnet_matmul_a8,
     ternary_matmul_reference,
+    ternary_matmul_a8_reference,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -44,6 +46,17 @@ def test_kernel_per_row_scale_and_bias(m):
     y = bitnet_matmul(x, packed, gamma_c, k=k, bias=bias)
     ref = ternary_matmul_reference(x, packed, gamma_c, k=k, bias=bias)
     torch.testing.assert_close(y.float(), ref.float(), atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize("m", [1, 4, 8])
+@pytest.mark.parametrize("n,k", [(256, 512), (1024, 4096)])
+def test_a8_kernel_matches_reference(m, n, k):
+    packed, gamma_c, _, _ = _make(n, k, seed=m + n + k + 1)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    y = bitnet_matmul_a8(x, packed, gamma_c, k=k)
+    ref = ternary_matmul_a8_reference(x, packed, gamma_c, k=k)
+    # both quantize activations identically; kernel vs reference should be very close
+    torch.testing.assert_close(y.float(), ref.float(), atol=5e-2, rtol=1e-2)
 
 
 def test_bitlinear_forward_matches_dequant():

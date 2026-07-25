@@ -30,12 +30,15 @@ class BitLinear(nn.Module):
         out_features: int,
         bias: bool = True,
         per_row: bool = False,
+        quantize_activations: bool = False,
         device=None,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.per_row = per_row
+        # When True use the W1.58-A8 path (int8 activations, integer accumulation).
+        self.quantize_activations = quantize_activations
 
         k_padded = ((in_features + PACK_PAD - 1) // PACK_PAD) * PACK_PAD
         # Non-trainable packed weight + scale (this layer is inference-only).
@@ -63,7 +66,12 @@ class BitLinear(nn.Module):
             self.bias = None
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, per_row: bool = False) -> "BitLinear":
+    def from_linear(
+        cls,
+        linear: nn.Linear,
+        per_row: bool = False,
+        quantize_activations: bool = False,
+    ) -> "BitLinear":
         """Quantize and pack an existing ``nn.Linear`` into a ``BitLinear``."""
         out_features, in_features = linear.weight.shape
         layer = cls(
@@ -71,6 +79,7 @@ class BitLinear(nn.Module):
             out_features,
             bias=linear.bias is not None,
             per_row=per_row,
+            quantize_activations=quantize_activations,
             device=linear.weight.device,
         )
         ternary, gamma = absmean_quantize(linear.weight.data, per_row=per_row)
@@ -83,14 +92,13 @@ class BitLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Import here so importing bitnet never hard-requires Triton.
-        from kernels.bitnet_kernel import bitnet_matmul
+        from kernels.bitnet_kernel import bitnet_matmul, bitnet_matmul_a8
 
         orig_shape = x.shape
         x2d = x.reshape(-1, self.in_features)
         bias = self.bias if self.bias is not None else None
-        y = bitnet_matmul(
-            x2d, self.packed_weight, self.gamma, self.in_features, bias=bias
-        )
+        matmul = bitnet_matmul_a8 if self.quantize_activations else bitnet_matmul
+        y = matmul(x2d, self.packed_weight, self.gamma, self.in_features, bias=bias)
         return y.reshape(*orig_shape[:-1], self.out_features)
 
     def dequantized_weight(self) -> torch.Tensor:
@@ -98,7 +106,9 @@ class BitLinear(nn.Module):
         return dequantize(self.packed_weight, self.gamma, self.in_features)
 
     def extra_repr(self) -> str:
+        scheme = "W1.58-A8" if self.quantize_activations else "W1.58-A16"
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, per_row={self.per_row}, packed_ternary=2bit"
+            f"bias={self.bias is not None}, per_row={self.per_row}, "
+            f"packed_ternary=2bit, scheme={scheme}"
         )

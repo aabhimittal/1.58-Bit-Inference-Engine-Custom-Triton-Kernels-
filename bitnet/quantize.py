@@ -125,3 +125,35 @@ def dequantize(packed: torch.Tensor, gamma: torch.Tensor, k: int) -> torch.Tenso
     CPU/large-batch fallback inside :class:`~bitnet.bitlinear.BitLinear`.
     """
     return unpack_ternary(packed, k) * gamma.to(torch.float32)
+
+
+# --------------------------------------------------------------------------------------
+# Activation quantization (the "A8" half of BitNet's W1.58-A8 scheme)
+# --------------------------------------------------------------------------------------
+ACT_QMAX = 127  # symmetric int8 range [-127, 127]
+
+
+def activation_quant(
+    x: torch.Tensor, eps: float = 1e-5
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activations to per-token int8 with a symmetric absmax scale.
+
+    BitNet b1.58 runs a **W1.58-A8** GEMM: weights are ternary and *activations* are
+    int8. Once both operands are integers, ``x_int * w`` with ``w ∈ {-1,0,1}`` is a
+    pure integer add / subtract / skip -- the multiplier is never used and the whole
+    inner product accumulates in ``int32``.
+
+    Args:
+        x: float activations ``[M, K]``. Each row (token) gets its own scale.
+        eps: floor on the per-token absmax to avoid divide-by-zero.
+
+    Returns:
+        ``(x_int8, inv_scale)`` where ``x_int8`` is ``int8 [M, K]`` and ``inv_scale`` is
+        ``[M, 1]`` such that ``x ≈ x_int8 * inv_scale``.
+    """
+    if x.dim() != 2:
+        raise ValueError(f"expected 2D activations, got shape {tuple(x.shape)}")
+    absmax = x.abs().amax(dim=-1, keepdim=True).clamp_min(eps)  # [M, 1]
+    scale = ACT_QMAX / absmax  # multiply-to-int
+    x_int8 = torch.round(x * scale).clamp_(-ACT_QMAX, ACT_QMAX).to(torch.int8)
+    return x_int8, absmax / ACT_QMAX  # inv_scale = 1 / scale

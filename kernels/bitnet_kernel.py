@@ -25,7 +25,7 @@ from typing import Optional
 
 import torch
 
-from bitnet.quantize import WEIGHTS_PER_BYTE, dequantize
+from bitnet.quantize import WEIGHTS_PER_BYTE, activation_quant, dequantize, unpack_ternary
 
 try:
     import triton
@@ -55,6 +55,28 @@ def ternary_matmul_reference(
     if bias is not None:
         y = y + bias
     return y
+
+
+def ternary_matmul_a8_reference(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    gamma: torch.Tensor,
+    k: int,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Golden reference for the **W1.58-A8** path (int8 activations, ternary weights).
+
+    Quantizes ``x`` to per-token int8, contracts against the ternary weight purely with
+    integer accumulation, then rescales by ``gamma`` (weight) and the per-token
+    activation scale. This is the exact math the fused int8 kernel implements.
+    """
+    x_int8, inv_scale = activation_quant(x)  # [M,K] int8, [M,1]
+    w = unpack_ternary(packed, k).to(torch.int32)  # [N, K] in {-1,0,1}
+    acc = x_int8.to(torch.int32) @ w.t()  # [M, N] pure integer add/sub
+    y = acc.float() * inv_scale.float() * gamma.reshape(1, -1).float()
+    if bias is not None:
+        y = y + bias.float()
+    return y.to(x.dtype)
 
 
 if HAS_TRITON:
@@ -113,8 +135,13 @@ if HAS_TRITON:
                 + offs_n[:, None] * stride_pn
                 + (k0 // WEIGHTS_PER_BYTE + byte_col[None, :]) * stride_pk
             )
+            # evict_last hint: the packed weight is tiny (2 bits/value) and is re-read on
+            # every decode step, so ask the cache to keep it L2-resident across launches.
             p = tl.load(
-                p_ptr, mask=n_mask[:, None] & k_mask[None, :], other=0
+                p_ptr,
+                mask=n_mask[:, None] & k_mask[None, :],
+                other=0,
+                eviction_policy="evict_last",
             ).to(tl.int32)  # [BLOCK_N, BLOCK_K] (same byte read 4x)
             w = ((p >> shift[None, :]) & 0b11) - 1  # {-1,0,1}
 
@@ -137,6 +164,78 @@ if HAS_TRITON:
             acc,
             mask=n_mask,
         )
+
+    @triton.autotune(configs=_gemv_configs(), key=["N", "K"])
+    @triton.jit
+    def _bitnet_a8_gemv_kernel(
+        x_ptr,  # int8 activations [M, K]
+        packed_ptr,
+        gamma_ptr,
+        xscale_ptr,  # per-token inverse activation scale [M]
+        bias_ptr,
+        y_ptr,
+        M,
+        N,
+        K,
+        stride_xm,
+        stride_xk,
+        stride_pn,
+        stride_pk,
+        stride_ym,
+        stride_yn,
+        PER_ROW_SCALE: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        byte_col = offs_k // WEIGHTS_PER_BYTE
+        shift = (offs_k % WEIGHTS_PER_BYTE) * 2
+        n_mask = offs_n < N
+
+        # Pure integer accumulator: int8 activation * {-1,0,1} weight = add / sub / skip.
+        acc = tl.zeros((BLOCK_N,), dtype=tl.int32)
+        for k0 in range(0, K, BLOCK_K):
+            k_idx = k0 + offs_k
+            k_mask = k_idx < K
+            x = tl.load(
+                x_ptr + pid_m * stride_xm + k_idx * stride_xk,
+                mask=k_mask,
+                other=0,
+            ).to(tl.int32)  # [BLOCK_K]
+
+            p_ptr = (
+                packed_ptr
+                + offs_n[:, None] * stride_pn
+                + (k0 // WEIGHTS_PER_BYTE + byte_col[None, :]) * stride_pk
+            )
+            p = tl.load(
+                p_ptr,
+                mask=n_mask[:, None] & k_mask[None, :],
+                other=0,
+                eviction_policy="evict_last",
+            ).to(tl.int32)
+            w = ((p >> shift[None, :]) & 0b11) - 1  # {-1,0,1}
+
+            xb = x[None, :]
+            contrib = tl.where(w == 1, xb, 0) - tl.where(w == -1, xb, 0)
+            acc += tl.sum(contrib, axis=1)
+
+        if PER_ROW_SCALE:
+            gamma = tl.load(gamma_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+        else:
+            gamma = tl.load(gamma_ptr).to(tl.float32)
+        xscale = tl.load(xscale_ptr + pid_m).to(tl.float32)
+        out = acc.to(tl.float32) * gamma * xscale
+
+        if HAS_BIAS:
+            out += tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+
+        tl.store(y_ptr + pid_m * stride_ym + offs_n * stride_yn, out, mask=n_mask)
 
     def _gemm_configs():
         return [
@@ -290,4 +389,56 @@ def bitnet_matmul(
             y.stride(0), y.stride(1),
             PER_ROW_SCALE=per_row, HAS_BIAS=has_bias,
         )
+    return y.to(x.dtype)
+
+
+def bitnet_matmul_a8(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    gamma: torch.Tensor,
+    k: int,
+    bias: Optional[torch.Tensor] = None,
+    force_reference: bool = False,
+) -> torch.Tensor:
+    """W1.58-A8 matmul: int8 activations x ternary weights, integer accumulation.
+
+    Same signature/semantics as :func:`bitnet_matmul` but quantizes ``x`` to per-token
+    int8 first, so the contraction is a pure integer add/subtract. This is the most
+    faithful realization of BitNet's "addition-only" GEMM. Falls back to the int8
+    reference on CPU / without Triton, and to the fp GEMM path for large ``M``.
+    """
+    if force_reference or not HAS_TRITON or not x.is_cuda:
+        return ternary_matmul_a8_reference(x, packed, gamma, k, bias)
+
+    assert x.dim() == 2, "x must be 2D [M, K]"
+    m, k_in = x.shape
+    n = packed.shape[0]
+    assert k_in == k, f"x has K={k_in} but weight expects K={k}"
+
+    # Large M: the int8 GEMV path is decode-oriented; defer to the fp16 tl.dot GEMM.
+    if m > GEMV_MAX_M:
+        return bitnet_matmul(x, packed, gamma, k, bias)
+
+    gamma_flat = gamma.reshape(-1).to(torch.float32).contiguous()
+    per_row = gamma_flat.numel() == n
+    if not per_row:
+        assert gamma_flat.numel() == 1, "gamma must have 1 or N elements"
+
+    x_int8, inv_scale = activation_quant(x)
+    x_int8 = x_int8.contiguous()
+    inv_scale = inv_scale.reshape(-1).to(torch.float32).contiguous()  # [M]
+    packed = packed.contiguous()
+    bias_t = bias.contiguous() if bias is not None else x.new_zeros(1)
+    has_bias = bias is not None
+    y = x.new_empty((m, n), dtype=torch.float32)
+
+    grid = lambda meta: (m, triton.cdiv(n, meta["BLOCK_N"]))
+    _bitnet_a8_gemv_kernel[grid](
+        x_int8, packed, gamma_flat, inv_scale, bias_t, y,
+        m, n, k,
+        x_int8.stride(0), x_int8.stride(1),
+        packed.stride(0), packed.stride(1),
+        y.stride(0), y.stride(1),
+        PER_ROW_SCALE=per_row, HAS_BIAS=has_bias,
+    )
     return y.to(x.dtype)
