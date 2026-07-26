@@ -61,14 +61,18 @@ def replace_linears(
     model: nn.Module,
     targets: Iterable[str] = DEFAULT_TARGETS,
     per_row: bool = False,
+    quantize_activations: bool = False,
 ) -> int:
     """In-place swap every targeted ``nn.Linear`` for a packed-ternary ``BitLinear``.
 
+    Set ``quantize_activations=True`` for the full W1.58-A8 (int8 activation) path.
     Returns the number of layers replaced.
     """
     count = 0
     for parent, child_name, linear in list(_iter_named_linears(model, targets)):
-        bit_layer = BitLinear.from_linear(linear, per_row=per_row)
+        bit_layer = BitLinear.from_linear(
+            linear, per_row=per_row, quantize_activations=quantize_activations
+        )
         bit_layer.to(linear.weight.device)
         setattr(parent, child_name, bit_layer)
         count += 1

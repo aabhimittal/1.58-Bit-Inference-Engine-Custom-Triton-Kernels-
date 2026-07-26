@@ -8,6 +8,7 @@ Public API:
 
 from .quantize import (
     absmean_quantize,
+    activation_quant,
     pack_ternary,
     unpack_ternary,
     dequantize,
@@ -16,6 +17,7 @@ from .bitlinear import BitLinear
 
 __all__ = [
     "absmean_quantize",
+    "activation_quant",
     "pack_ternary",
     "unpack_ternary",
     "dequantize",
